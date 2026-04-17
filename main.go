@@ -1,6 +1,8 @@
 // ffix — find video files that cannot stream to a browser because the moov
 // atom is not at the beginning of the file, and report whether
 // `ffmpeg -c copy -movflags +faststart` will resolve the issue.
+// For non-MP4 containers it inspects the codec to determine whether a
+// lossless re-mux (-c copy) or a full re-encode is needed.
 package main
 
 import (
@@ -62,6 +64,8 @@ const (
 type fileResult struct {
 	Path         string `json:"path"`
 	Format       string `json:"format,omitempty"`
+	VideoCodec   string `json:"video_codec,omitempty"`
+	AudioCodec   string `json:"audio_codec,omitempty"`
 	IsMp4Family  bool   `json:"is_mp4_family"`
 	Streamable   bool   `json:"streamable"`
 	CanFastStart bool   `json:"can_faststart"`
@@ -72,7 +76,9 @@ type fileResult struct {
 
 // ── MP4 binary parsing ────────────────────────────────────────────────────────
 
-// parseMoovPosition reads top-level ISO BMFF boxes and returns the position of
+// https://dev.to/alfg/a-quick-dive-into-mp4-57fo
+
+// parseMoovPosition reads top-level ISO BMFF (Base Media File Format) boxes and returns the position of
 // the moov atom relative to the mdat atom.  It only reads box headers, never
 // the payload, so it stays fast even on multi-gigabyte files.
 func parseMoovPosition(path string) (moovStatus, error) {
@@ -154,45 +160,89 @@ done:
 	}
 }
 
-// ── ffprobe format detection ──────────────────────────────────────────────────
+// ── ffprobe format + codec detection ─────────────────────────────────────────
 
 type ffprobeOutput struct {
 	Format struct {
 		FormatName string `json:"format_name"`
 	} `json:"format"`
+	Streams []struct {
+		CodecType string `json:"codec_type"` // "video" | "audio" | "subtitle" | …
+		CodecName string `json:"codec_name"`
+	} `json:"streams"`
 }
 
-// probeFormat returns the ffprobe format_name string for the file.
-func probeFormat(path string) (string, error) {
+// probeFile returns the ffprobe format_name and the first video/audio codec
+// names found in the file.
+func probeFile(path string) (formatName, videoCodec, audioCodec string, err error) {
 	out, err := exec.Command(
 		"ffprobe",
 		"-v", "quiet",
 		"-print_format", "json",
 		"-show_format",
+		"-show_streams",
 		path,
 	).Output()
 	if err != nil {
-		return "", fmt.Errorf("ffprobe: %w", err)
+		return "", "", "", fmt.Errorf("ffprobe: %w", err)
 	}
 	var p ffprobeOutput
 	if err := json.Unmarshal(out, &p); err != nil {
-		return "", fmt.Errorf("ffprobe parse: %w", err)
+		return "", "", "", fmt.Errorf("ffprobe parse: %w", err)
 	}
-	return p.Format.FormatName, nil
-}
-
-// isMp4FormatName returns true when the ffprobe format_name indicates an ISO
-// BMFF container (e.g. "mov,mp4,m4a,3gp,3g2,mj2").
-func isMp4FormatName(name string) bool {
-	mp4Keywords := []string{"mp4", "mov", "m4v", "m4a", "3gp", "3g2", "f4v", "ipod", "mj2"}
-	lower := strings.ToLower(name)
-	for _, kw := range mp4Keywords {
-		if strings.Contains(lower, kw) {
-			return true
+	formatName = p.Format.FormatName
+	for _, s := range p.Streams {
+		switch s.CodecType {
+		case "video":
+			if videoCodec == "" {
+				videoCodec = s.CodecName
+			}
+		case "audio":
+			if audioCodec == "" {
+				audioCodec = s.CodecName
+			}
 		}
 	}
-	return false
+	return formatName, videoCodec, audioCodec, nil
 }
+
+// mp4CompatibleVideo lists video codecs that can be placed inside an MP4
+// container with -c:v copy (no re-encode needed).
+var mp4CompatibleVideo = map[string]bool{
+	"h264":       true, // universally supported in browsers
+	"hevc":       true, // Safari + hardware decoders; valid in MP4
+	"av1":        true, // modern browsers via ISO BMFF
+	"mpeg4":      true, // older MPEG-4 Part 2; valid in MP4
+	"mjpeg":      true,
+	"mpeg1video": false,
+	"mpeg2video": false,
+	"vp8":        false, // WebM only
+	"vp9":        false, // re-mux to MP4 technically possible but browser support inconsistent
+	"theora":     false,
+	"wmv1":       false,
+	"wmv2":       false,
+	"wmv3":       false,
+	"vc1":        false,
+}
+
+// mp4CompatibleAudio lists audio codecs that can be placed inside an MP4
+// container with -c:a copy.
+var mp4CompatibleAudio = map[string]bool{
+	"aac":    true,
+	"mp3":    true,
+	"ac3":    true,
+	"eac3":   true,
+	"alac":   true,
+	"mp2":    true,
+	"vorbis": false, // Ogg/WebM only
+	"opus":   false, // RFC 7845 allows MP4 but browser support is inconsistent
+	"wmav1":  false,
+	"wmav2":  false,
+	"flac":   false, // valid in MP4 but not broadly supported in browsers
+}
+
+func canCopyVideo(codec string) bool { return mp4CompatibleVideo[strings.ToLower(codec)] }
+func canCopyAudio(codec string) bool { return mp4CompatibleAudio[strings.ToLower(codec)] }
 
 // ── output helpers ────────────────────────────────────────────────────────────
 
@@ -204,11 +254,32 @@ func faststartCmd(path string) string {
 	return fmt.Sprintf("ffmpeg -i %q -c copy -movflags +faststart %q", path, out)
 }
 
-// convertCmd builds a command to re-mux a non-MP4 file into a streamable MP4.
-func convertCmd(path string) string {
+// remuxOrEncodeCmd builds the ffmpeg command for a non-MP4 file.
+// If both codecs are MP4-compatible it uses -c copy (lossless re-mux);
+// otherwise it falls back to re-encoding video to H.264 and/or audio to AAC.
+func remuxOrEncodeCmd(path, videoCodec, audioCodec string) (cmd, note string) {
 	base := strings.TrimSuffix(path, filepath.Ext(path))
 	out := base + ".mp4"
-	return fmt.Sprintf("ffmpeg -i %q -c:v copy -c:a copy -movflags +faststart %q", path, out)
+
+	vc, ac := "copy", "copy"
+	var reasons []string
+
+	if videoCodec != "" && !canCopyVideo(videoCodec) {
+		vc = "libx264"
+		reasons = append(reasons, videoCodec+" → H.264 re-encode")
+	}
+	if audioCodec != "" && !canCopyAudio(audioCodec) {
+		ac = "aac"
+		reasons = append(reasons, audioCodec+" → AAC re-encode")
+	}
+
+	cmd = fmt.Sprintf("ffmpeg -i %q -c:v %s -c:a %s -movflags +faststart %q", path, vc, ac, out)
+	if len(reasons) > 0 {
+		note = "re-encode required: " + strings.Join(reasons, ", ")
+	} else {
+		note = "lossless re-mux (codecs are MP4-compatible)"
+	}
+	return cmd, note
 }
 
 // ── analysis ──────────────────────────────────────────────────────────────────
@@ -221,12 +292,21 @@ func analyzeFile(path string, hasFFprobe bool) fileResult {
 	if !res.IsMp4Family {
 		res.Streamable = false
 		res.CanFastStart = false
-		res.Note = "non-MP4 container — no moov atom; faststart does not apply"
-		res.FixCommand = convertCmd(path)
 		if hasFFprobe {
-			if fmt, err := probeFormat(path); err == nil {
-				res.Format = fmt
+			fmtName, vc, ac, err := probeFile(path)
+			if err == nil {
+				res.Format = fmtName
+				res.VideoCodec = vc
+				res.AudioCodec = ac
+				cmd, note := remuxOrEncodeCmd(path, vc, ac)
+				res.FixCommand = cmd
+				res.Note = "non-MP4 container — no moov atom; faststart does not apply; " + note
+			} else {
+				res.Note = "non-MP4 container — no moov atom; faststart does not apply"
+				res.Error = err.Error()
 			}
+		} else {
+			res.Note = "non-MP4 container — no moov atom; faststart does not apply"
 		}
 		return res
 	}
@@ -238,10 +318,12 @@ func analyzeFile(path string, hasFFprobe bool) fileResult {
 		return res
 	}
 
-	// Optionally enrich with ffprobe format name.
+	// Optionally enrich with ffprobe format name and codecs.
 	if hasFFprobe {
-		if fmt, err := probeFormat(path); err == nil {
-			res.Format = fmt
+		if fmtName, vc, ac, err := probeFile(path); err == nil {
+			res.Format = fmtName
+			res.VideoCodec = vc
+			res.AudioCodec = ac
 		}
 	}
 
@@ -276,9 +358,9 @@ func analyzeFile(path string, hasFFprobe bool) fileResult {
 
 func main() {
 	var (
-		verbose    = flag.Bool("v", false, "show all files, including already-streamable ones")
+		verbose      = flag.Bool("v", false, "show all files, including already-streamable ones")
 		includeOther = flag.Bool("all-formats", false, "also report non-MP4 format files")
-		jsonOut    = flag.Bool("json", false, "output results as JSON")
+		jsonOut      = flag.Bool("json", false, "output results as JSON")
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `ffix — find video files that will not stream to a browser due to a
@@ -382,6 +464,12 @@ Exit codes:
 		fmt.Printf("%s\n", r.Path)
 		if r.Format != "" {
 			fmt.Printf("  format       : %s\n", r.Format)
+		}
+		if r.VideoCodec != "" {
+			fmt.Printf("  video codec  : %s\n", r.VideoCodec)
+		}
+		if r.AudioCodec != "" {
+			fmt.Printf("  audio codec  : %s\n", r.AudioCodec)
 		}
 		fmt.Printf("  streamable   : %v\n", r.Streamable)
 		fmt.Printf("  can-faststart: %v\n", r.CanFastStart)
