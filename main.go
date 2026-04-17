@@ -501,6 +501,7 @@ func main() {
 		fix          = flag.Bool("fix", false, "fix non-streamable files (write→verify→swap; keeps .bak of originals)")
 		noBackup     = flag.Bool("no-backup", false, "with -fix: delete original after successful swap instead of keeping .bak")
 		dryRun       = flag.Bool("dry-run", false, "show what -fix would do without making any changes")
+		maxFixes     = flag.Int("max-fixes", 0, "with -fix: stop after this many successful fixes (0 = unlimited)")
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `ffix — find video files that will not stream to a browser due to a
@@ -626,7 +627,12 @@ Exit codes:
 		if *noBackup {
 			fmt.Fprintln(os.Stderr, "warning: -no-backup is set — originals will be deleted after a successful fix")
 		}
+		var fixed int
 		for i := range results {
+			if *maxFixes > 0 && fixed >= *maxFixes {
+				fmt.Fprintf(os.Stderr, "note: reached -max-fixes %d, stopping\n", *maxFixes)
+				break
+			}
 			r := &results[i]
 			if r.Streamable || r.Error != "" {
 				continue
@@ -636,6 +642,7 @@ Exit codes:
 			if r.FixError != "" {
 				fmt.Printf("  FAILED: %s\n\n", r.FixError)
 			} else {
+				fixed++
 				fmt.Printf("  ok → %s\n", r.FixOutput)
 				if r.BackupPath != "" {
 					fmt.Printf("  backup → %s\n", r.BackupPath)
